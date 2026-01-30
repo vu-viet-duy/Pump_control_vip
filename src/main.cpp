@@ -1,14 +1,18 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 #include "Tank.h"
 #include "Relay.h"
-#include "CommandHandler.h"
+#include "cmdline.h"
+#include "serial_log.h"
 #include "network.h"
 
+// ===== HARDWARE OBJECTS =====
 Tank waterTank(4);
 Tank chemTank(5);
 Tank mixTank(6);
 
-// ===== KHAI BÁO RELAY =====
 Relay Rwatermain(7);
 Relay Rmixmain(8);
 Relay Rwatertomix(9);
@@ -17,7 +21,10 @@ Relay Rchetopump(11);
 Relay Rpumptomix(12);
 Relay Pump(13);
 
-CommandHandler cmdHandler;
+// ===== COMMUNICATION =====
+CmdLine cmdLine;
+
+// ===== STATE MACHINE =====
 enum Step
 {
   IDLE,
@@ -25,16 +32,38 @@ enum Step
   STEP2,
   STEP3,
   STEP4,
+  IRRIGATE_WATER,
+  IRRIGATE_SOLUTION
 };
 
-Step currentStep = IDLE;
+volatile Step currentStep = IDLE;
+SemaphoreHandle_t stepMutex;
 
-float totalWater = 0;  // tổng nước cần cho Mix
-float diluteWater = 0; // nước pha hóa chất
-float chemAmount = 0;  // lượng hóa chất
-float mixStartVol = 0; // mốc thể tích ban đầu
+// ===== PROCESS PARAMETERS =====
+struct ProcessParams
+{
+  float totalWater;
+  float diluteWater;
+  float chemAmount;
+  float mixStartVol;
+};
+ProcessParams processParams = {0, 0, 0, 0};
+SemaphoreHandle_t paramsMutex;
 
-// ===== HELPER FUNCTION =====
+// ===== SENSOR DATA (SHARED) =====
+volatile float waterVol = 0;
+volatile float chemVol = 0;
+volatile float mixVol = 0;
+SemaphoreHandle_t sensorMutex;
+
+// ===== TASK HANDLES =====
+TaskHandle_t taskCommandHandle = NULL;
+TaskHandle_t taskControlHandle = NULL;
+TaskHandle_t taskProcessHandle = NULL;
+TaskHandle_t taskSensorHandle = NULL;
+TaskHandle_t taskNetworkHandle = NULL;
+
+// ===== HELPER FUNCTIONS =====
 void closeAllValves()
 {
   Rwatermain.off();
@@ -45,223 +74,468 @@ void closeAllValves()
   Rpumptomix.off();
 }
 
-float totalWater = 0;
-float diluteWater = 0;
-float powderAmount = 0;
-float mixStartVol = 0;
-
-// ...existing code...
-void handleCommand(const String &cmd)
+// ═════════════════════════════════════════════════════════════
+// ⭐⭐⭐⭐ TASK 1: CONTROL - Priority 4 (Highest)
+// ═════════════════════════════════════════════════════════════
+void TaskControl(void *pvParameters)
 {
-  String c = cmd;
-  c.trim();
-  c.toUpperCase();
+  SerialLog::log("[TaskControl] Started on Core", xPortGetCoreID());
 
-  if (c.startsWith("START "))
+  while (true)
   {
-    float a, b, d;
-    if (sscanf(c.c_str(), "START %f/%f/%f", &a, &b, &d) == 3)
+    // Kiểm tra có lệnh mới từ queue không
+    if (cmdLine.available())
     {
-      if (b >= a || a <= 0 || b <= 0 || d <= 0)
+      String cmd = cmdLine.readStringUntil('\n');
+      cmd.trim();
+      cmd.toUpperCase();
+
+      if (cmd.startsWith("START "))
       {
-        Serial.println("❌ Tham số không hợp lệ");
-        return;
+        float a, b, d;
+        if (sscanf(cmd.c_str(), "START %f/%f/%f", &a, &b, &d) == 3)
+        {
+          if (b > a || a <= 0 || b <= 0 || d <= 0)
+          {
+            SerialLog::log("❌ Invalid parameters");
+          }
+          else
+          {
+            // Cập nhật parameters
+            if (xSemaphoreTake(paramsMutex, portMAX_DELAY))
+            {
+              processParams.totalWater = a;
+              processParams.diluteWater = b;
+              processParams.chemAmount = d;
+              
+              if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(10)))
+              {
+                processParams.mixStartVol = mixVol;
+                xSemaphoreGive(sensorMutex);
+              }
+              xSemaphoreGive(paramsMutex);
+            }
+
+            // Chuyển sang STEP1
+            if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+            {
+              currentStep = STEP1;
+              xSemaphoreGive(stepMutex);
+            }
+
+            SerialLog::log("▶ START | Water:", a, "L | Dilute:", b, "L | Chem:", d, "L");
+          }
+        }
+        else
+        {
+          SerialLog::log("❌ Format: START <total>/<dilute>/<chem>");
+        }
       }
-
-      totalWater = a;
-      diluteWater = b;
-      chemAmount = d;
-
-      mixStartVol = mixTank.getValue();
-      currentStep = STEP1;
-
-      Serial.printf("▶ START | Nước: %.0fL | Pha: %.0fL | Hóa chất: %.0fL\n",
-                    totalWater, diluteWater, chemAmount);
+      else if (cmd == "V1")
+      {
+        if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+        {
+          currentStep = IRRIGATE_WATER;
+          xSemaphoreGive(stepMutex);
+        }
+        SerialLog::log("→ Irrigate clean water");
+      }
+      else if (cmd == "V2")
+      {
+        if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+        {
+          currentStep = IRRIGATE_SOLUTION;
+          xSemaphoreGive(stepMutex);
+        }
+        SerialLog::log("→ Irrigate solution");
+      }
+      else if (cmd == "STOP")
+      {
+        if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+        {
+          currentStep = IDLE;
+          xSemaphoreGive(stepMutex);
+        }
+        closeAllValves();
+        Pump.off();
+        SerialLog::log("⊗ STOP");
+      }
+      else if (cmd == "STATUS")
+      {
+        if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(10)))
+        {
+          SerialLog::log("Water:", waterVol, "L | Chem:", chemVol, "L | Mix:", mixVol, "L");
+          xSemaphoreGive(sensorMutex);
+        }
+      }
     }
-    else
-    {
-      Serial.println("❌ Format: START <total>/<dilute>/<chem>");
-    }
-  }
-  else if (c == "V1")
-  {
-    closeAllValves();
-    Rwatermain.on();
-    Serial.println("→ Tưới nước sạch");
-  }
-  else if (c == "V2")
-  {
-    closeAllValves();
-    Rmixmain.on();
-    Serial.println("→ Tưới dung dịch");
-  }
-  else if (c == "STOP")
-  {
-    closeAllValves();
-    Pump.off();
-    currentStep = IDLE;
-    Serial.println("⊗ STOP");
-  }
-  else if (c == "STATUS")
-  {
-    Serial.printf("Water %.1fL | Chem %.1fL | Mix %.1fL\n",
-                  waterTank.getValue(),
-                  chemTank.getValue(),
-                  mixTank.getValue());
+
+    vTaskDelay(pdMS_TO_TICKS(50)); // 50ms cycle
   }
 }
 
-// ...existing code...
+// ═════════════════════════════════════════════════════════════
+// ⭐⭐⭐ TASK 2: COMMAND - Priority 3
+// Thu thập lệnh từ các nguồn LOCAL (Serial, BLE, Button...)
+// MQTT push TRỰC TIẾP vào queue (trong mqttCallback)
+// ═════════════════════════════════════════════════════════════
+void TaskCommand(void *pvParameters)
+{
+  SerialLog::log("[TaskCommand] Started on Core", xPortGetCoreID());
 
+  while (true)
+  {
+    // ===== NGUỒN 1: SERIAL =====
+    if (Serial.available())
+    {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      if (cmd.length() > 0)
+      {
+        cmdLine.println(cmd);
+        SerialLog::log("[CMD:Serial]", cmd);
+      }
+    }
+
+    // ===== NGUỒN 2: BLE =====
+    // TODO: Thêm BLE command handler ở đây
+    // if (BLE.available()) {
+    //   String cmd = BLE.readStringUntil('\n');
+    //   cmdLine.println(cmd);
+    //   SerialLog::log("[CMD:BLE]", cmd);
+    // }
+
+    // ===== NGUỒN 3: BUTTON/GPIO =====
+    // TODO: Đọc button physical
+    // if (digitalRead(BUTTON_START) == LOW) {
+    //   cmdLine.println("START 400/50/10");
+    //   SerialLog::log("[CMD:Button] START");
+    //   vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
+    // }
+
+    vTaskDelay(pdMS_TO_TICKS(10)); // 10ms cycle
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
+// ⭐⭐⭐ TASK 3: PROCESS - Priority 3
+// ═════════════════════════════════════════════════════════════
+void TaskProcess(void *pvParameters)
+{
+  SerialLog::log("[TaskProcess] Started on Core", xPortGetCoreID());
+
+  Step localStep;
+  float localWaterVol, localChemVol, localMixVol;
+  ProcessParams localParams;
+
+  while (true)
+  {
+    // Đọc current step
+    if (xSemaphoreTake(stepMutex, pdMS_TO_TICKS(10)))
+    {
+      localStep = currentStep;
+      xSemaphoreGive(stepMutex);
+    }
+
+    // Đọc sensor data
+    if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(10)))
+    {
+      localWaterVol = waterVol;
+      localChemVol = chemVol;
+      localMixVol = mixVol;
+      xSemaphoreGive(sensorMutex);
+    }
+
+    // Đọc parameters
+    if (xSemaphoreTake(paramsMutex, pdMS_TO_TICKS(10)))
+    {
+      localParams = processParams;
+      xSemaphoreGive(paramsMutex);
+    }
+
+    // State machine
+    switch (localStep)
+    {
+    case IDLE:
+      closeAllValves();
+      Pump.off();
+      break;
+
+    case STEP1: // Bơm nước vào Mix
+    {
+      Rwatertomix.on();
+      Rwatermain.off();
+      Rmixtoche.off();
+      Rchetopump.off();
+      Rpumptomix.off();
+      Rmixmain.off();
+
+      if (localMixVol >= localParams.totalWater)
+      {
+        closeAllValves();
+        SerialLog::log("✓ Filled Mix with", localParams.totalWater, "L");
+        SerialLog::log(">>> STEP 2: Dilute chemical...");
+        
+        if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+        {
+          currentStep = STEP2;
+          xSemaphoreGive(stepMutex);
+        }
+      }
+      else
+      {
+        SerialLog::log("[STEP1] Filling |", localMixVol, "L /", localParams.totalWater, "L");
+      }
+      break;
+    }
+
+    case STEP2: // Pha loãng hóa chất
+    {
+      float waterPumped = localParams.totalWater - localMixVol;
+
+      Rmixtoche.on();
+      Rwatertomix.off();
+      Rwatermain.off();
+      Rchetopump.off();
+      Rpumptomix.off();
+      Rmixmain.off();
+      Pump.off();
+
+      if (waterPumped >= localParams.chemAmount)
+      {
+        closeAllValves();
+        SerialLog::log("✓ Diluted with", localParams.chemAmount, "L water");
+        SerialLog::log(">>> STEP 3: Pump chemical...");
+        
+        if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+        {
+          currentStep = STEP3;
+          xSemaphoreGive(stepMutex);
+        }
+      }
+      else
+      {
+        SerialLog::log("[STEP2] Diluting |", waterPumped, "L /", localParams.chemAmount, "L");
+      }
+      break;
+    }
+
+    case STEP3: // Bơm hóa chất vào Mix
+    {
+      Rchetopump.on();
+      Rpumptomix.on();
+      Pump.on();
+      Rwatertomix.off();
+      Rwatermain.off();
+      Rmixtoche.off();
+      Rmixmain.off();
+
+      if (localChemVol <= 1.0f)
+      {
+        closeAllValves();
+        Pump.off();
+        SerialLog::log("✓ Pumped all chemical to Mix");
+        SerialLog::log(">>> STEP 4: Mixing...");
+        
+        if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+        {
+          currentStep = STEP4;
+          xSemaphoreGive(stepMutex);
+        }
+      }
+      else
+      {
+        SerialLog::log("[STEP3] Pumping | Chem:", localChemVol, "L");
+      }
+      break;
+    }
+
+    case STEP4: // Khuấy trộn
+    {
+      closeAllValves();
+      Pump.on();
+
+      SerialLog::log("\n========== RESULT ==========");
+      SerialLog::log("📦 Mix:", localMixVol, "L");
+      SerialLog::log("💧 Water:", localParams.totalWater, "L");
+      SerialLog::log("🧪 Chemical:", localParams.chemAmount, "L");
+      SerialLog::log("============================");
+      SerialLog::log("✓ Complete! Ready: V1 | V2");
+
+      if (xSemaphoreTake(stepMutex, portMAX_DELAY))
+      {
+        currentStep = IDLE;
+        xSemaphoreGive(stepMutex);
+      }
+      break;
+    }
+
+    case IRRIGATE_WATER:
+      closeAllValves();
+      Rwatermain.on();
+      break;
+
+    case IRRIGATE_SOLUTION:
+      closeAllValves();
+      Rmixmain.on();
+      break;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // 100ms cycle
+  }
+}
+// ═════════════════════════════════════════════════════════════
+// ⭐⭐ TASK 4: SENSOR - Priority 2
+// ═════════════════════════════════════════════════════════════
+void TaskSensor(void *pvParameters)
+{
+  SerialLog::log("[TaskSensor] Started on Core", xPortGetCoreID());
+
+  while (true)
+  {
+    // Đọc các cảm biến
+    float w = waterTank.getValue();
+    float c = chemTank.getValue();
+    float m = mixTank.getValue();
+
+    // Cập nhật shared variables
+    if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(10)))
+    {
+      waterVol = w;
+      chemVol = c;
+      mixVol = m;
+      xSemaphoreGive(sensorMutex);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(200)); // 200ms cycle
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
+// ⭐ TASK 5: NETWORK - Priority 1 (Lowest)
+// ═════════════════════════════════════════════════════════════
+void TaskNetwork(void *pvParameters)
+{
+  SerialLog::log("[TaskNetwork] Started on Core", xPortGetCoreID());
+  
+  // Init network
+  networkInit();
+  
+  unsigned long lastPublish = 0;
+
+  while (true)
+  {
+    // Maintain WiFi/MQTT
+    networkMaintain();
+
+    // Publish every 5 seconds
+    if (millis() - lastPublish >= 5000)
+    {
+      lastPublish = millis();
+      
+      float w, c, m;
+      if (xSemaphoreTake(sensorMutex, pdMS_TO_TICKS(10)))
+      {
+        w = waterVol;
+        c = chemVol;
+        m = mixVol;
+        xSemaphoreGive(sensorMutex);
+      }
+      
+      // Tính % (giả sử max = 500L)
+      float wPercent = (w / 500.0f) * 100.0f;
+      float cPercent = (c / 100.0f) * 100.0f;
+      float mPercent = (m / 500.0f) * 100.0f;
+      
+      networkPublish(wPercent, cPercent, mPercent);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // 100ms cycle
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
+// SETUP & LOOP
+// ═════════════════════════════════════════════════════════════
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("\n=== PUMP CONTROLLER ===\n");
-  Serial.println("Lệnh:");
-  Serial.println("  START <lít>   - Bơm nước vào Mix (VD: START 400)");
-  Serial.println("  CHEM <lít>    - Lấy hóa chất (VD: CHEM 50)");
-  Serial.println("  V1            - Tưới nước sạch");
-  Serial.println("  V2            - Tưới dung dịch");
-  Serial.println("  STOP          - Dừng tưới\n");
+  SerialLog::log("\n========================================");
+  SerialLog::log("     PUMP CONTROLLER - RTOS Version     ");
+  SerialLog::log("========================================");
+  SerialLog::log("\nCommands:");
+  SerialLog::log("  START <total>/<dilute>/<chem>");
+  SerialLog::log("  V1     - Irrigate clean water");
+  SerialLog::log("  V2     - Irrigate solution");
+  SerialLog::log("  STOP   - Stop all");
+  SerialLog::log("  STATUS - Show status\n");
 
-  // Set callback cho CommandHandler
-  cmdHandler.begin(handleCommand);
+  // Tạo mutexes
+  stepMutex = xSemaphoreCreateMutex();
+  paramsMutex = xSemaphoreCreateMutex();
+  sensorMutex = xSemaphoreCreateMutex();
 
-  networkInit();
-  delay(500);
+  SerialLog::log("Creating RTOS tasks...\n");
+
+  // Tạo tasks với priority theo yêu cầu
+  xTaskCreatePinnedToCore(
+      TaskControl,
+      "TaskControl",
+      4096,
+      NULL,
+      4, // ⭐⭐⭐⭐ Priority 4 - Highest
+      &taskControlHandle,
+      0 // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+      TaskCommand,
+      "TaskCommand",
+      2048,
+      NULL,
+      3, // ⭐⭐⭐ Priority 3
+      &taskCommandHandle,
+      0 // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+      TaskProcess,
+      "TaskProcess",
+      4096,
+      NULL,
+      3, // ⭐⭐⭐ Priority 3
+      &taskProcessHandle,
+      1 // Core 1
+  );
+
+  xTaskCreatePinnedToCore(
+      TaskSensor,
+      "TaskSensor",
+      2048,
+      NULL,
+      2, // ⭐⭐ Priority 2
+      &taskSensorHandle,
+      1 // Core 1
+  );
+
+  xTaskCreatePinnedToCore(
+      TaskNetwork,
+      "TaskNetwork",
+      8192,
+      NULL,
+      1, // ⭐ Priority 1 - Lowest
+      &taskNetworkHandle,
+      0 // Core 0
+  );
+
+  SerialLog::log("✓ All tasks created!");
+  SerialLog::log("========================================\n");
 }
 
 void loop()
 {
-  networkMaintain();
-  float waterVol = waterTank.getValue();
-  float chemVol = chemTank.getValue();
-  float mixVol = mixTank.getValue();
-
-  // ===== HANDLE COMMAND TỪ SERIAL, MQTT, BLE =====
-  cmdHandler.onSerial();      // Serial dùng chung handler
-  cmdHandler.onMQTT(mqttCmd); // MQTT dùng chung handler
-  mqttCmd = "";               // Clear để tránh xử lý lặp
-  cmdHandler.onBLE(bleCmd);   // BLE dùng chung handler
-  bleCmd = "";                // Clear để tránh xử lý lặp
-
-  // ===== STATE MACHINE =====
-  switch (currentStep)
-  {
-  case IDLE:
-  {
-    closeAllValves();
-    break;
-  }
-
-  case STEP1:
-  {
-    Serial.printf("[STEP1] bơm nước vào Mix ");
-    Rwatertomix.on();
-    Rwatermain.off();
-    Rmixtoche.off();
-    Rchetopump.off();
-    Rpumptomix.off();
-    Rmixmain.off();
-    if (mixTank.getValue() >= totalWater)
-    {
-      closeAllValves();
-      Serial.printf("\n✓ Đã bơm đủ nước vào Mix: %.0fL\n\n", totalWater);
-      Serial.printf("Sẵn sàng lấy hóa chất: CHEM <lít>\n");
-      currentStep = STEP2;
-    }
-    else
-    {
-      Serial.printf("| Hiện tại: %.1fL / %.0fL\r", mixVol, totalWater);
-    }
-    break;
-  }
-
-  case STEP2:
-  {
-    // Pha loãng hóa chất: bơm nước từ Mix sang Chem
-    // Theo dõi lượng nước đã bơm = mixBeforeChem - mixVol hiện tại
-    float waterPumped = totalWater - mixVol;
-
-    Rmixtoche.on(); // Mở van Mix → Chem
-    Rwatertomix.off();
-    Rwatermain.off();
-    Rchetopump.off();
-    Rpumptomix.off();
-    Rmixmain.off();
-    Pump.off();
-
-    Serial.printf("[STEP2] Pha loãng hóa chất | Đã bơm: %.1fL / %.0fL\r", waterPumped, chemAmount);
-
-    // Kiểm tra đã bơm đủ nước để pha loãng chưa
-    if (waterPumped >= chemAmount)
-    {
-      closeAllValves();
-      Pump.off();
-      Serial.printf("\n✓ Đã pha loãng xong: %.0fL nước vào bình hóa chất\n", chemAmount);
-      Serial.println(">>> STEP 3: Bơm hóa chất vào Mix...\n");
-      currentStep = STEP3;
-    }
-    break;
-  }
-
-  case STEP3:
-  {
-    // Bơm hóa chất đã pha loãng từ Chem vào Mix
-    // Mở van Chem → Pump → Mix
-    Rchetopump.on(); // Van từ Chem đến Pump
-    Rpumptomix.on(); // Van từ Pump đến Mix
-    Pump.on();       // Bật bơm
-    Rwatertomix.off();
-    Rwatermain.off();
-    Rmixtoche.off();
-    Rmixmain.off();
-
-    Serial.printf("[STEP3] Bơm hóa chất vào Mix | Chem: %.1fL | Mix: %.1fL\r", chemVol, mixVol);
-
-    // Kiểm tra bình Chem đã rỗng chưa (hoặc gần rỗng)
-    if (chemVol <= 1.0f) // Còn < 1L coi như rỗng
-    {
-      closeAllValves();
-      Pump.off();
-      Serial.printf("\n✓ Đã bơm hết hóa chất vào Mix!\n");
-      Serial.println(">>> STEP 4: Khuấy trộn...\n");
-      currentStep = STEP4;
-    }
-    break;
-  }
-  case STEP4:
-  {
-    closeAllValves();
-    Pump.on();
-
-    float finalMixVol = mixTank.getValue();
-    float finalMixPercent = mixTank.getPercentage();
-
-    Serial.println("\n========== KẾT QUẢ PHA TRỘN ==========");
-    Serial.printf("📦 Mix Tank: %.1fL (%.0f%%)\n", finalMixVol, finalMixPercent);
-    Serial.printf("💧 Nước đã dùng: %.1fL\n", totalWater);
-    Serial.printf("🧪 Hóa chất đã pha: %.1fL\n", chemAmount);
-    Serial.printf("📊 Tỷ lệ pha: 1:%.0f (hóa chất:nước)\n", (totalWater - chemAmount) / chemAmount);
-    Serial.println("=======================================\n");
-    Serial.println("✓ Hoàn tất quy trình!");
-    Serial.println("Sẵn sàng tưới: V1 (nước sạch) | V2 (dung dịch)\n");
-
-    currentStep = IDLE;
-    break;
-  }
-  }
-
-  // ===== MQTT PUBLISH =====
-  if (millis() - lastPublish >= 5000)
-  {
-    lastPublish = millis();
-    networkPublish(waterTank.getPercentage(),
-                   chemTank.getPercentage(),
-                   mixTank.getPercentage());
-  }
-
-  delay(100);
+  // FreeRTOS đang chạy, loop() không cần làm gì
+  vTaskDelay(portMAX_DELAY);
 }

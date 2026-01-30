@@ -1,5 +1,6 @@
 #include "network.h"
 #include "secrets.h"
+#include <serial_log.h>
 
 WiFiClientSecure wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -16,25 +17,26 @@ static bool wifiConnected = false;
 static bool mqttConnected = false;
 static unsigned long lastReconnectAttempt = 0;
 
-// ===== Command Storage =====
-String mqttCmd = "";
-String bleCmd = "";
-
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  String message = "";
-  for (unsigned int i = 0; i < length; i++)
-  {
-    message += (char)payload[i];
-  }
+  // Chỉ xử lý topic COMMAND
+  if (strcmp(topic, TOPIC_COMMAND) != 0)
+    return;
 
-  Serial.printf("MQTT Received [%s]: %s\n", topic, message.c_str());
+  // Copy payload vào buffer với giới hạn STR_LEN
+  char buf[STR_LEN] = {0};
+  int copyLen = min((int)length, STR_LEN - 1);
+  memcpy(buf, payload, copyLen);
+  buf[copyLen] = '\0';
 
-  // Handle MQTT commands
-  if (strcmp(topic, TOPIC_COMMAND) == 0)
+  String cmd(buf);
+  cmd.trim();
+
+  if (cmd.length() > 0)
   {
-    mqttCmd = message;
-    Serial.printf("📨 Command stored: %s\n", mqttCmd.c_str());
+    // ⭐ PUSH TRỰC TIẾP VÀO QUEUE - Thread-safe, không mất lệnh
+    cmdLine.println(cmd);
+    SerialLog::log("[CMD:MQTT]", cmd);
   }
 }
 
@@ -46,27 +48,27 @@ bool connectWiFi()
     return true;
   }
 
-  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+  SerialLog::log("Connecting to WiFi:", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20)
   {
     delay(500);
-    Serial.print(".");
+    SerialLog::log(".");
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
     wifiConnected = true;
-    Serial.printf("\n✓ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    SerialLog::log("\n✓ WiFi connected! IP:", WiFi.localIP().toString());
     return true;
   }
   else
   {
     wifiConnected = false;
-    Serial.println("\n✗ WiFi connection failed!");
+    SerialLog::log("\n✗ WiFi connection failed!");
     return false;
   }
 }
@@ -82,7 +84,7 @@ bool connectMQTT()
   if (!wifiConnected)
     return false;
 
-  Serial.printf("Connecting to MQTT: %s:%d\n", MQTT_BROKER, MQTT_PORT);
+  SerialLog::log("Connecting to MQTT:", MQTT_BROKER, ":", MQTT_PORT);
 
   // Configure MQTT
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
@@ -97,25 +99,25 @@ bool connectMQTT()
   if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
   {
     mqttConnected = true;
-    Serial.println("✓ MQTT connected!");
+    SerialLog::log("✓ MQTT connected!");
 
     // Subscribe to command topic
     mqttClient.subscribe(TOPIC_COMMAND);
-    Serial.printf("Subscribed to: %s\n", TOPIC_COMMAND);
+    SerialLog::log("Subscribed to:", TOPIC_COMMAND);
 
     return true;
   }
   else
   {
     mqttConnected = false;
-    Serial.printf("✗ MQTT connection failed! State: %d\n", mqttClient.state());
+    SerialLog::log("✗ MQTT connection failed! State:", mqttClient.state());
     return false;
   }
 }
 
 void networkInit()
 {
-  Serial.println("\n=== Network Init ===");
+  SerialLog::log("\n=== Network Init ===");
 
   // Connect WiFi
   connectWiFi();
@@ -127,7 +129,7 @@ void networkInit()
     connectMQTT();
   }
 
-  Serial.println("===================\n");
+  SerialLog::log("===================\n");
 }
 
 void networkMaintain()
@@ -142,7 +144,7 @@ void networkMaintain()
     if (millis() - lastReconnectAttempt > 30000)
     {
       lastReconnectAttempt = millis();
-      Serial.println("WiFi disconnected, reconnecting...");
+      SerialLog::log("WiFi disconnected, reconnecting...");
       connectWiFi();
     }
   }
@@ -160,7 +162,7 @@ void networkMaintain()
     if (millis() - lastReconnectAttempt > 10000)
     {
       lastReconnectAttempt = millis();
-      Serial.println("MQTT disconnected, reconnecting...");
+      SerialLog::log("MQTT disconnected, reconnecting...");
       connectMQTT();
     }
   }
@@ -176,13 +178,12 @@ void networkPublish(float waterPercent, float chemPercent, float mixPercent)
 {
   if (!mqttClient.connected())
   {
-    Serial.println("⚠️  MQTT not connected, skipping publish");
+    SerialLog::log("⚠️  MQTT not connected, skipping publish");
     return;
   }
 
   char payload[100];
-
-  // Publish water tank
+  
   snprintf(payload, sizeof(payload), "{\"percent\":%.1f}", waterPercent);
   mqttClient.publish(TOPIC_WATER, payload);
 
@@ -200,8 +201,7 @@ void networkPublish(float waterPercent, float chemPercent, float mixPercent)
            waterPercent, chemPercent, mixPercent);
   mqttClient.publish(TOPIC_STATUS, payload);
 
-  Serial.printf("📡 Published: Water=%.0f%%, Chem=%.0f%%, Mix=%.0f%%\n",
-                waterPercent, chemPercent, mixPercent);
+  SerialLog::log("📡 Published: Water=", waterPercent, "%, Chem=", chemPercent, "%, Mix=", mixPercent, "%");
 }
 
 bool networkIsConnected()

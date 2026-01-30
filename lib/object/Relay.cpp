@@ -1,5 +1,6 @@
 #include "Relay.h"
-hahahahhaha
+
+
 Relay::Relay(uint8_t p)
     : pin(p), state(false)
 {

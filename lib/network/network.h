@@ -5,11 +5,11 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include "PubSubClient.h"
+#include <cmdline.h>
 
 extern WiFiClientSecure wifiClient;
 extern PubSubClient mqttClient;
-extern String mqttCmd;
-extern String bleCmd;
+extern CmdLine cmdLine; // ⭐ Để mqttCallback push trực tiếp vào queue
 
 void networkInit();
 void networkMaintain();
