@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Pump Control",
+			"type": "shell",
+			"command": "platformio run --environment dfrobot_firebeetle2_esp32s3"
+		}
+	]
+}

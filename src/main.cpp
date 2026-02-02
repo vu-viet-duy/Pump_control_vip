@@ -1,25 +1,36 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include "PCAL9535A.h"
 #include "Tank.h"
 #include "Relay.h"
 #include "cmdline.h"
 #include "serial_log.h"
 #include "network.h"
 
+// ===== I2C CONFIG =====
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define I2C_FREQ 400000
+
+// ===== GPIO EXPANDER =====
+PCAL9535A::PCAL9535A<TwoWire> gpioExpander(Wire);
+
 // ===== HARDWARE OBJECTS =====
 Tank waterTank(4);
 Tank chemTank(5);
 Tank mixTank(6);
 
-Relay Rwatermain(7);
-Relay Rmixmain(8);
-Relay Rwatertomix(9);
-Relay Rmixtoche(10);
-Relay Rchetopump(11);
-Relay Rpumptomix(12);
-Relay Pump(13);
+// Relay pins on PCAL9535A (P0-P6)
+Relay Rwatermain(0, &gpioExpander);
+Relay Rmixmain(1, &gpioExpander);
+Relay Rwatertomix(2, &gpioExpander);
+Relay Rmixtoche(3, &gpioExpander);
+Relay Rchetopump(4, &gpioExpander);
+Relay Rpumptomix(5, &gpioExpander);
+Relay Pump(6, &gpioExpander);
 
 // ===== COMMUNICATION =====
 CmdLine cmdLine;
@@ -196,22 +207,6 @@ void TaskCommand(void *pvParameters)
         SerialLog::log("[CMD:Serial]", cmd);
       }
     }
-
-    // ===== NGUỒN 2: BLE =====
-    // TODO: Thêm BLE command handler ở đây
-    // if (BLE.available()) {
-    //   String cmd = BLE.readStringUntil('\n');
-    //   cmdLine.println(cmd);
-    //   SerialLog::log("[CMD:BLE]", cmd);
-    // }
-
-    // ===== NGUỒN 3: BUTTON/GPIO =====
-    // TODO: Đọc button physical
-    // if (digitalRead(BUTTON_START) == LOW) {
-    //   cmdLine.println("START 400/50/10");
-    //   SerialLog::log("[CMD:Button] START");
-    //   vTaskDelay(pdMS_TO_TICKS(500)); // Debounce
-    // }
 
     vTaskDelay(pdMS_TO_TICKS(10)); // 10ms cycle
   }
@@ -461,10 +456,42 @@ void setup()
 {
   Serial.begin(115200);
   delay(1000);
+  
+  Serial.println("\n\n=== PUMP CONTROLLER STARTING ===");
+  Serial.flush();
 
   SerialLog::log("\n========================================");
   SerialLog::log("     PUMP CONTROLLER - RTOS Version     ");
   SerialLog::log("========================================");
+
+  // ===== INIT I2C & GPIO EXPANDER =====
+  SerialLog::log("\n🔧 Initializing I2C...");
+  Serial.flush();
+  
+  Wire.begin(SDA_PIN, SCL_PIN, I2C_FREQ);
+  delay(100);
+  
+  SerialLog::log("🔧 Initializing PCAL9535A GPIO Expander...");
+  Serial.flush();
+  
+  gpioExpander.begin();
+  delay(100);
+  
+  SerialLog::log("🔧 Initializing relay pins...");
+  Serial.flush();
+  
+  // Initialize all relay pins
+  Rwatermain.begin();
+  Rmixmain.begin();
+  Rwatertomix.begin();
+  Rmixtoche.begin();
+  Rchetopump.begin();
+  Rpumptomix.begin();
+  Pump.begin();
+  
+  SerialLog::log("✅ All relays initialized\n");
+  Serial.flush();
+
   SerialLog::log("\nCommands:");
   SerialLog::log("  START <total>/<dilute>/<chem>");
   SerialLog::log("  V1     - Irrigate clean water");
@@ -483,9 +510,9 @@ void setup()
   xTaskCreatePinnedToCore(
       TaskControl,
       "TaskControl",
-      4096,
+      4096, // 
       NULL,
-      4, // ⭐⭐⭐⭐ Priority 4 - Highest
+      4, 
       &taskControlHandle,
       0 // Core 0
   );
@@ -493,9 +520,9 @@ void setup()
   xTaskCreatePinnedToCore(
       TaskCommand,
       "TaskCommand",
-      2048,
+      4096,  // Tăng từ 2048 -> 4096 để tránh stack overflow
       NULL,
-      3, // ⭐⭐⭐ Priority 3
+      3, // 
       &taskCommandHandle,
       0 // Core 0
   );
@@ -513,7 +540,7 @@ void setup()
   xTaskCreatePinnedToCore(
       TaskSensor,
       "TaskSensor",
-      2048,
+      4096,  // Tăng từ 2048 -> 4096
       NULL,
       2, // ⭐⭐ Priority 2
       &taskSensorHandle,
