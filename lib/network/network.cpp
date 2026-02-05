@@ -15,7 +15,8 @@ PubSubClient mqttClient(wifiClient);
 // ===== Connection State =====
 static bool wifiConnected = false;
 static bool mqttConnected = false;
-static unsigned long lastReconnectAttempt = 0;
+static unsigned long lastWiFiReconnect = 0;  // Timer riêng cho WiFi
+static unsigned long lastMQTTReconnect = 0;  // Timer riêng cho MQTT
 
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
@@ -48,14 +49,27 @@ bool connectWiFi()
     return true;
   }
 
-  SerialLog::log("Connecting to WiFi:", WIFI_SSID);
+  // ⭐ FIX: ESP32-S3 Power Management
+  SerialLog::log("🔧 Configuring WiFi power...");
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(true);          // Lưu WiFi vào flash
+  WiFi.setAutoConnect(true);      // Auto connect khi khởi động
+  WiFi.setAutoReconnect(true);    // Auto reconnect khi bị mất
+  
+  // Disable WiFi sleep mode
+  WiFi.setSleep(false);
+  
+  WiFi.disconnect(true);
+  delay(500);
+
+  SerialLog::log("📡 Connecting to:", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) // 15s
   {
     delay(500);
-    SerialLog::log(".");
+    Serial.print(".");
     attempts++;
   }
 
@@ -63,12 +77,13 @@ bool connectWiFi()
   {
     wifiConnected = true;
     SerialLog::log("\n✓ WiFi connected! IP:", WiFi.localIP().toString());
+    SerialLog::log("   RSSI:", WiFi.RSSI(), "dBm");
     return true;
   }
   else
   {
     wifiConnected = false;
-    SerialLog::log("\n✗ WiFi connection failed!");
+    SerialLog::log("\n✗ WiFi failed! Status:", WiFi.status());
     return false;
   }
 }
@@ -84,33 +99,30 @@ bool connectMQTT()
   if (!wifiConnected)
     return false;
 
-  SerialLog::log("Connecting to MQTT:", MQTT_BROKER, ":", MQTT_PORT);
+  SerialLog::log("🔗 Connecting to MQTT...");
 
-  // Configure MQTT
+  // ⭐ FIX: Thử bỏ SSL certificate tạm thời
+  // wifiClient.setCACert(ROOT_CA_CERT);
+  wifiClient.setInsecure(); // Accept any certificate
+  
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(90);  // Tăng keepalive
 
-  // Set SSL certificate for secure connection
-  wifiClient.setCACert(ROOT_CA_CERT);
-
-  // Connect to MQTT
   String clientId = MQTT_CLIENT_ID;
+  clientId += "_" + String(millis() % 10000); // Random suffix
 
   if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
   {
     mqttConnected = true;
     SerialLog::log("✓ MQTT connected!");
-
-    // Subscribe to command topic
     mqttClient.subscribe(TOPIC_COMMAND);
-    SerialLog::log("Subscribed to:", TOPIC_COMMAND);
-
     return true;
   }
   else
   {
     mqttConnected = false;
-    SerialLog::log("✗ MQTT connection failed! State:", mqttClient.state());
+    SerialLog::log("✗ MQTT failed! State:", mqttClient.state());
     return false;
   }
 }
@@ -134,37 +146,47 @@ void networkInit()
 
 void networkMaintain()
 {
-  // Maintain WiFi connection
-  if (WiFi.status() != WL_CONNECTED)
+  // ⭐ CHECK: WiFi status với ít frequency hơn
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 5000) // Check mỗi 5s thôi
   {
-    wifiConnected = false;
-    mqttConnected = false;
-
-    // Try reconnect every 30 seconds
-    if (millis() - lastReconnectAttempt > 30000)
+    lastWiFiCheck = millis();
+    
+    if (WiFi.status() != WL_CONNECTED)
     {
-      lastReconnectAttempt = millis();
-      SerialLog::log("WiFi disconnected, reconnecting...");
-      connectWiFi();
+      wifiConnected = false;
+      mqttConnected = false;
+
+      // Try WiFi reconnect every 30 seconds
+      if (millis() - lastWiFiReconnect > 30000)
+      {
+        lastWiFiReconnect = millis();
+        SerialLog::log("📡 WiFi lost, reconnecting...");
+        connectWiFi();
+      }
+    }
+    else
+    {
+      wifiConnected = true;
     }
   }
-  else
-  {
-    wifiConnected = true;
-  }
 
-  // Maintain MQTT connection
+  // Maintain MQTT connection (chỉ khi WiFi OK)
   if (wifiConnected && !mqttClient.connected())
   {
     mqttConnected = false;
 
-    // Try reconnect every 10 seconds
-    if (millis() - lastReconnectAttempt > 10000)
+    // Try MQTT reconnect every 15 seconds
+    if (millis() - lastMQTTReconnect > 15000)
     {
-      lastReconnectAttempt = millis();
-      SerialLog::log("MQTT disconnected, reconnecting...");
+      lastMQTTReconnect = millis();
+      SerialLog::log("🔗 MQTT lost, reconnecting...");
       connectMQTT();
     }
+  }
+  else if (mqttClient.connected())
+  {
+    mqttConnected = true;
   }
 
   // Process MQTT messages
