@@ -3,7 +3,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
-#define STR_LEN 16
+#define STR_LEN 64  // ✅ FIXED: Increased from 16 to 64
 #define QUEUE_LENGTH 10
 
 class CmdLine

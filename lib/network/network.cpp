@@ -15,16 +15,12 @@ PubSubClient mqttClient(wifiClient);
 // ===== Connection State =====
 static bool wifiConnected = false;
 static bool mqttConnected = false;
-static unsigned long lastWiFiReconnect = 0;  // Timer riêng cho WiFi
-static unsigned long lastMQTTReconnect = 0;  // Timer riêng cho MQTT
+static unsigned long lastReconnectAttempt = 0;
 
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  // Chỉ xử lý topic COMMAND
-  if (strcmp(topic, TOPIC_COMMAND) != 0)
-    return;
+  if (strcmp(topic, TOPIC_COMMAND) != 0) return;
 
-  // Copy payload vào buffer với giới hạn STR_LEN
   char buf[STR_LEN] = {0};
   int copyLen = min((int)length, STR_LEN - 1);
   memcpy(buf, payload, copyLen);
@@ -33,197 +29,162 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   String cmd(buf);
   cmd.trim();
 
-  if (cmd.length() > 0)
-  {
-    // ⭐ PUSH TRỰC TIẾP VÀO QUEUE - Thread-safe, không mất lệnh
+  if (cmd.length() > 0) {
     cmdLine.println(cmd);
-    SerialLog::log("[CMD:MQTT]", cmd);
+    SerialLog::log("[MQTT]", cmd);
   }
 }
 
 bool connectWiFi()
 {
-  if (WiFi.status() == WL_CONNECTED)
-  {
+  if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
     return true;
   }
 
-  // ⭐ FIX: ESP32-S3 Power Management
-  SerialLog::log("🔧 Configuring WiFi power...");
+  SerialLog::log("🔌 Connecting WiFi:", WIFI_SSID);
+  
+  // Simple, reliable config
   WiFi.mode(WIFI_STA);
-  WiFi.persistent(true);          // Lưu WiFi vào flash
-  WiFi.setAutoConnect(true);      // Auto connect khi khởi động
-  WiFi.setAutoReconnect(true);    // Auto reconnect khi bị mất
-  
-  // Disable WiFi sleep mode
   WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true); // Let ESP32 handle reconnects
   
-  WiFi.disconnect(true);
-  delay(500);
-
-  SerialLog::log("📡 Connecting to:", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  // Wait up to 15 seconds
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) // 15s
-  {
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
     attempts++;
   }
+  Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
+  if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    SerialLog::log("\n✓ WiFi connected! IP:", WiFi.localIP().toString());
-    SerialLog::log("   RSSI:", WiFi.RSSI(), "dBm");
+    SerialLog::log("✓ WiFi OK | IP:", WiFi.localIP().toString(), "| RSSI:", WiFi.RSSI());
     return true;
   }
-  else
-  {
-    wifiConnected = false;
-    SerialLog::log("\n✗ WiFi failed! Status:", WiFi.status());
-    return false;
-  }
+
+  wifiConnected = false;
+  SerialLog::log("❌ WiFi failed");
+  return false;
 }
 
 bool connectMQTT()
 {
-  if (mqttClient.connected())
-  {
+  if (mqttClient.connected()) {
     mqttConnected = true;
     return true;
   }
 
-  if (!wifiConnected)
+  if (WiFi.status() != WL_CONNECTED) {
     return false;
+  }
 
-  SerialLog::log("🔗 Connecting to MQTT...");
+  SerialLog::log("🔗 Connecting MQTT:", MQTT_BROKER);
 
-  // ⭐ FIX: Thử bỏ SSL certificate tạm thời
-  // wifiClient.setCACert(ROOT_CA_CERT);
-  wifiClient.setInsecure(); // Accept any certificate
-  
+  wifiClient.setInsecure();
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setKeepAlive(90);  // Tăng keepalive
+  mqttClient.setKeepAlive(60);
 
-  String clientId = MQTT_CLIENT_ID;
-  clientId += "_" + String(millis() % 10000); // Random suffix
+  String clientId = String(MQTT_CLIENT_ID) + "_" + String(random(10000));
 
-  if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
-  {
+  bool connected = (strlen(MQTT_USERNAME) > 0) 
+    ? mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)
+    : mqttClient.connect(clientId.c_str());
+
+  if (connected) {
     mqttConnected = true;
-    SerialLog::log("✓ MQTT connected!");
     mqttClient.subscribe(TOPIC_COMMAND);
+    SerialLog::log("✓ MQTT OK | ID:", clientId);
     return true;
   }
-  else
-  {
-    mqttConnected = false;
-    SerialLog::log("✗ MQTT failed! State:", mqttClient.state());
-    return false;
-  }
+
+  mqttConnected = false;
+  SerialLog::log("❌ MQTT failed | Code:", mqttClient.state());
+  return false;
 }
 
 void networkInit()
 {
-  SerialLog::log("\n=== Network Init ===");
-
-  // Connect WiFi
-  connectWiFi();
-
-  // Connect MQTT if WiFi is connected
-  if (wifiConnected)
-  {
+  SerialLog::log("=== Network Init ===");
+  
+  if (connectWiFi()) {
     delay(1000);
     connectMQTT();
   }
-
-  SerialLog::log("===================\n");
+  
+  SerialLog::log("===================");
 }
 
 void networkMaintain()
 {
-  // ⭐ CHECK: WiFi status với ít frequency hơn
-  static unsigned long lastWiFiCheck = 0;
-  if (millis() - lastWiFiCheck > 5000) // Check mỗi 5s thôi
-  {
-    lastWiFiCheck = millis();
-    
-    if (WiFi.status() != WL_CONNECTED)
-    {
-      wifiConnected = false;
-      mqttConnected = false;
+  unsigned long now = millis();
 
-      // Try WiFi reconnect every 30 seconds
-      if (millis() - lastWiFiReconnect > 30000)
-      {
-        lastWiFiReconnect = millis();
-        SerialLog::log("📡 WiFi lost, reconnecting...");
-        connectWiFi();
-      }
+  // Throttle reconnect attempts - only every 30 seconds
+  if (now - lastReconnectAttempt < 30000) {
+    // Just process MQTT messages if connected
+    if (mqttClient.connected()) {
+      mqttClient.loop();
     }
-    else
-    {
-      wifiConnected = true;
-    }
+    return;
   }
 
-  // Maintain MQTT connection (chỉ khi WiFi OK)
-  if (wifiConnected && !mqttClient.connected())
-  {
-    mqttConnected = false;
+  lastReconnectAttempt = now;
 
-    // Try MQTT reconnect every 15 seconds
-    if (millis() - lastMQTTReconnect > 15000)
-    {
-      lastMQTTReconnect = millis();
-      SerialLog::log("🔗 MQTT lost, reconnecting...");
+  // Check and reconnect WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    mqttConnected = false;
+    SerialLog::log("📡 WiFi lost, reconnecting...");
+    
+    if (connectWiFi()) {
+      delay(1000);
       connectMQTT();
     }
-  }
-  else if (mqttClient.connected())
-  {
-    mqttConnected = true;
-  }
-
-  // Process MQTT messages
-  if (mqttClient.connected())
-  {
-    mqttClient.loop();
+  } 
+  // WiFi OK, check MQTT
+  else {
+    wifiConnected = true;
+    
+    if (!mqttClient.connected()) {
+      mqttConnected = false;
+      SerialLog::log("🔗 MQTT lost, reconnecting...");
+      connectMQTT();
+    } else {
+      mqttConnected = true;
+      mqttClient.loop();
+    }
   }
 }
 
-void networkPublish(float waterPercent, float chemPercent, float mixPercent)
+void networkPublish(float waterVolume, float chemVolume, float mixVolume)
 {
-  if (!mqttClient.connected())
-  {
-    SerialLog::log("⚠️  MQTT not connected, skipping publish");
+  if (!mqttClient.connected()) {
     return;
   }
 
   char payload[100];
-  
-  snprintf(payload, sizeof(payload), "{\"percent\":%.1f}", waterPercent);
-  mqttClient.publish(TOPIC_WATER, payload);
 
-  // Publish chem tank
-  snprintf(payload, sizeof(payload), "{\"percent\":%.1f}", chemPercent);
-  mqttClient.publish(TOPIC_CHEM, payload);
+  // Publish individual tanks (volume in Liters)
+  snprintf(payload, sizeof(payload), "volume :%.1f", waterVolume);
+  mqttClient.publish(TOPIC_WATER, payload, false);
 
-  // Publish mix tank
-  snprintf(payload, sizeof(payload), "{\"percent\":%.1f}", mixPercent);
-  mqttClient.publish(TOPIC_MIX, payload);
+  snprintf(payload, sizeof(payload), "volume:%.1f", chemVolume);
+  mqttClient.publish(TOPIC_CHEM, payload, false);
+
+  snprintf(payload, sizeof(payload), "volume :%.1f", mixVolume);
+  mqttClient.publish(TOPIC_MIX, payload, false);
 
   // Publish combined status
   snprintf(payload, sizeof(payload),
-           "{\"water\":%.1f,\"chem\":%.1f,\"mix\":%.1f}",
-           waterPercent, chemPercent, mixPercent);
-  mqttClient.publish(TOPIC_STATUS, payload);
+           "wate :%.1f, che :%.1f, mix:%.1f",
+           waterVolume, chemVolume, mixVolume);
+  mqttClient.publish(TOPIC_STATUS, payload, false);
 
-  SerialLog::log("📡 Published: Water=", waterPercent, "%, Chem=", chemPercent, "%, Mix=", mixPercent, "%");
+  SerialLog::log("📡 Published | W:", waterVolume, "L C:", chemVolume, "L M:", mixVolume, "L");
 }
 
 bool networkIsConnected()
