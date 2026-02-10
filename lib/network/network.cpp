@@ -184,7 +184,7 @@ void networkPublish(float waterVolume, float chemVolume, float mixVolume)
            waterVolume, chemVolume, mixVolume);
   mqttClient.publish(TOPIC_STATUS, payload, false);
 
-  SerialLog::log("📡 Published | W:", waterVolume, "L C:", chemVolume, "L M:", mixVolume, "L");
+ // SerialLog::log("📡 Published | W:", waterVolume, "L C:", chemVolume, "L M:", mixVolume, "L");
 }
 
 bool networkIsConnected()
